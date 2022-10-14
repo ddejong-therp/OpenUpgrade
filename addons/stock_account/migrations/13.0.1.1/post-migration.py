@@ -198,97 +198,98 @@ def generate_stock_valuation_layer(env):
     )
     companies = company_obj.search([])
     products = product_obj.with_context(active_test=False).search([("type", "in", ("product", "consu"))])
-    all_svl_list = []
     for company in companies:
         _logger.info("Doing svl for company_id {}".format(company.id))
-        for product in products:
-            history_lines = []
-            real_time = product.valuation == 'real_time'
-            if product.cost_method != "fifo":
-                history_lines = get_product_price_history(env, company.id, product.id, real_time)
-            moves = get_stock_moves(env, company.id, product.id, real_time)
-            svl_in_vals_list = []
-            svl_out_vals_list = []
-            svl_man_vals_list = []
-            svl_in_index = 0
-            h_index = 0
-            previous_price = 0.0
-            previous_qty = 0.0
-            for move in moves:
-                is_dropship = True if move["move_type"] in ("dropship", "dropship_return") else False
-                if product.cost_method in ("average", "standard"):
-                    # useless for Fifo because we have price unit in stock.move
-                    # Add manual adjusts
-                    have_qty = not float_is_zero(previous_qty, precision_digits=precision_uom)
-                    while h_index < len(history_lines) and history_lines[h_index]["datetime"] < move["date"]:
+        for products_chunk in openupgrade.chunked(products, single=False):
+            all_svl_list = []
+            for product in products_chunk:
+                history_lines = []
+                real_time = product.valuation == 'real_time'
+                if product.cost_method != "fifo":
+                    history_lines = get_product_price_history(env, company.id, product.id, real_time)
+                moves = get_stock_moves(env, company.id, product.id, real_time)
+                svl_in_vals_list = []
+                svl_out_vals_list = []
+                svl_man_vals_list = []
+                svl_in_index = 0
+                h_index = 0
+                previous_price = 0.0
+                previous_qty = 0.0
+                for move in moves:
+                    is_dropship = True if move["move_type"] in ("dropship", "dropship_return") else False
+                    if product.cost_method in ("average", "standard"):
+                        # useless for Fifo because we have price unit in stock.move
+                        # Add manual adjusts
+                        have_qty = not float_is_zero(previous_qty, precision_digits=precision_uom)
+                        while h_index < len(history_lines) and history_lines[h_index]["datetime"] < move["date"]:
+                            price_history_rec = history_lines[h_index]
+                            if float_compare(price_history_rec["cost"], previous_price, precision_digits=precision_price):
+                                if have_qty:
+                                    svl_vals = _prepare_man_svl_vals(
+                                        price_history_rec, previous_price, previous_qty, company, product)
+                                    svl_man_vals_list.append(svl_vals)
+                                previous_price = price_history_rec["cost"]
+                            h_index += 1
+                    # Add in svl
+                    if move["move_type"] == "in" or is_dropship:
+                        total_qty = previous_qty + move["product_qty"]
+                        # TODO: is needed vaccum if total_qty is negative?
+                        if float_is_zero(total_qty, precision_digits=precision_uom):
+                            previous_price = move["price_unit"]
+                        else:
+                            previous_price = float_round(
+                                (previous_price * previous_qty + move["price_unit"] * move["product_qty"]) / total_qty,
+                                precision_digits=precision_price)
+                        svl_vals = _prepare_in_svl_vals(
+                            move, move["product_qty"], move["price_unit"], product, is_dropship)
+                        svl_in_vals_list.append(svl_vals)
+                        previous_qty = total_qty
+                    # Add out svl
+                    if move["move_type"] == "out" or is_dropship:
+                        qty = move["product_qty"]
+                        if product.cost_method in ("average", "fifo") and not is_dropship:
+                            # Reduce remaininig qty in svl of type "in"
+                            while qty > 0 and svl_in_index < len(svl_in_vals_list):
+                                if svl_in_vals_list[svl_in_index]["remaining_qty"] >= qty:
+                                    candidate_cost = (svl_in_vals_list[svl_in_index]["remaining_value"] /
+                                                    svl_in_vals_list[svl_in_index]["remaining_qty"])
+                                    svl_in_vals_list[svl_in_index]["remaining_qty"] -= qty
+                                    svl_in_vals_list[svl_in_index]["remaining_value"] = float_round(
+                                        candidate_cost * svl_in_vals_list[svl_in_index]["remaining_qty"],
+                                        precision_digits=precision_price)
+                                    qty = 0
+                                elif svl_in_vals_list[svl_in_index]["remaining_qty"]:
+                                    qty -= svl_in_vals_list[svl_in_index]["remaining_qty"]
+                                    svl_in_vals_list[svl_in_index]["remaining_qty"] = 0.0
+                                    svl_in_vals_list[svl_in_index]["remaining_value"] = 0.0
+                                    svl_in_index += 1
+                                else:
+                                    svl_in_index += 1
+                        if product.cost_method == 'fifo':
+                            svl_vals = _prepare_out_svl_vals(
+                                move, move["product_qty"], abs(move["price_unit"]), product)
+                        else:
+                            svl_vals = _prepare_out_svl_vals(
+                                move, move["product_qty"], previous_price, product)
+                        svl_out_vals_list.append(svl_vals)
+                        previous_qty -= move["product_qty"]
+                # Add manual adjusts after last move
+                if product.cost_method in ("average", "standard") and not float_is_zero(
+                        previous_qty, precision_digits=precision_uom):
+                    # useless for Fifo because we have price unit on product form
+                    while h_index < len(history_lines):
                         price_history_rec = history_lines[h_index]
                         if float_compare(price_history_rec["cost"], previous_price, precision_digits=precision_price):
-                            if have_qty:
-                                svl_vals = _prepare_man_svl_vals(
-                                    price_history_rec, previous_price, previous_qty, company, product)
-                                svl_man_vals_list.append(svl_vals)
+                            svl_vals = _prepare_man_svl_vals(
+                                price_history_rec, previous_price, previous_qty, company, product)
+                            svl_man_vals_list.append(svl_vals)
                             previous_price = price_history_rec["cost"]
                         h_index += 1
-                # Add in svl
-                if move["move_type"] == "in" or is_dropship:
-                    total_qty = previous_qty + move["product_qty"]
-                    # TODO: is needed vaccum if total_qty is negative?
-                    if float_is_zero(total_qty, precision_digits=precision_uom):
-                        previous_price = move["price_unit"]
-                    else:
-                        previous_price = float_round(
-                            (previous_price * previous_qty + move["price_unit"] * move["product_qty"]) / total_qty,
-                            precision_digits=precision_price)
-                    svl_vals = _prepare_in_svl_vals(
-                        move, move["product_qty"], move["price_unit"], product, is_dropship)
-                    svl_in_vals_list.append(svl_vals)
-                    previous_qty = total_qty
-                # Add out svl
-                if move["move_type"] == "out" or is_dropship:
-                    qty = move["product_qty"]
-                    if product.cost_method in ("average", "fifo") and not is_dropship:
-                        # Reduce remaininig qty in svl of type "in"
-                        while qty > 0 and svl_in_index < len(svl_in_vals_list):
-                            if svl_in_vals_list[svl_in_index]["remaining_qty"] >= qty:
-                                candidate_cost = (svl_in_vals_list[svl_in_index]["remaining_value"] /
-                                                  svl_in_vals_list[svl_in_index]["remaining_qty"])
-                                svl_in_vals_list[svl_in_index]["remaining_qty"] -= qty
-                                svl_in_vals_list[svl_in_index]["remaining_value"] = float_round(
-                                    candidate_cost * svl_in_vals_list[svl_in_index]["remaining_qty"],
-                                    precision_digits=precision_price)
-                                qty = 0
-                            elif svl_in_vals_list[svl_in_index]["remaining_qty"]:
-                                qty -= svl_in_vals_list[svl_in_index]["remaining_qty"]
-                                svl_in_vals_list[svl_in_index]["remaining_qty"] = 0.0
-                                svl_in_vals_list[svl_in_index]["remaining_value"] = 0.0
-                                svl_in_index += 1
-                            else:
-                                svl_in_index += 1
-                    if product.cost_method == 'fifo':
-                        svl_vals = _prepare_out_svl_vals(
-                            move, move["product_qty"], abs(move["price_unit"]), product)
-                    else:
-                        svl_vals = _prepare_out_svl_vals(
-                            move, move["product_qty"], previous_price, product)
-                    svl_out_vals_list.append(svl_vals)
-                    previous_qty -= move["product_qty"]
-            # Add manual adjusts after last move
-            if product.cost_method in ("average", "standard") and not float_is_zero(
-                    previous_qty, precision_digits=precision_uom):
-                # useless for Fifo because we have price unit on product form
-                while h_index < len(history_lines):
-                    price_history_rec = history_lines[h_index]
-                    if float_compare(price_history_rec["cost"], previous_price, precision_digits=precision_price):
-                        svl_vals = _prepare_man_svl_vals(
-                            price_history_rec, previous_price, previous_qty, company, product)
-                        svl_man_vals_list.append(svl_vals)
-                        previous_price = price_history_rec["cost"]
-                    h_index += 1
-            all_svl_list.extend(svl_in_vals_list + svl_out_vals_list + svl_man_vals_list)
-    if all_svl_list:
-        all_svl_list = sorted(all_svl_list, key=lambda k: (k["create_date"]))
-        _logger.info("To create {} svl records".format(len(all_svl_list)))
-        query_insert(env.cr, "stock_valuation_layer", all_svl_list)
+                all_svl_list.extend(svl_in_vals_list + svl_out_vals_list + svl_man_vals_list)
+            if all_svl_list:
+                all_svl_list = sorted(all_svl_list, key=lambda k: (k["create_date"]))
+                _logger.info("To create {} svl records".format(len(all_svl_list)))
+                query_insert(env.cr, "stock_valuation_layer", all_svl_list)
 
 
 @openupgrade.migrate()
