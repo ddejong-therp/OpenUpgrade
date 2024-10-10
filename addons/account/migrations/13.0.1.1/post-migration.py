@@ -851,23 +851,30 @@ def create_account_tax_repartition_lines(env):
 def move_tags_from_taxes_to_repartition_lines(env):
     openupgrade.logged_query(
         env.cr, """
-        WITH RECURSIVE tax2parent(tax_id, parent_id) AS (
-            SELECT id, id FROM account_tax
+        WITH RECURSIVE tax2parent(tax_id, parent_id, depth) AS (
+            SELECT id, id, 0 FROM account_tax
             UNION ALL
-            SELECT rel.child_tax, rel.parent_tax
+            SELECT rel.child_tax, rel.parent_tax, depth + 1
             FROM account_tax_filiation_rel rel
             JOIN tax2parent ON tax2parent.parent_id=rel.child_tax
+        ), x AS (
+            INSERT INTO account_account_tag_account_tax_repartition_line_rel (
+                account_tax_repartition_line_id, account_account_tag_id)
+            SELECT atrl.id, atat.account_account_tag_id
+            FROM account_tax_account_tag atat
+            JOIN tax2parent ON atat.account_tax_id=tax2parent.parent_id
+            JOIN account_tax_repartition_line atrl ON
+                (tax2parent.tax_id = atrl.invoice_tax_id OR
+                tax2parent.tax_id = atrl.refund_tax_id)
+            WHERE tax2parent.depth < 20
+            ON CONFLICT DO NOTHING
         )
-        INSERT INTO account_account_tag_account_tax_repartition_line_rel (
-            account_tax_repartition_line_id, account_account_tag_id)
-        SELECT atrl.id, atat.account_account_tag_id
-        FROM account_tax_account_tag atat
-        JOIN tax2parent ON atat.account_tax_id=tax2parent.parent_id
-        JOIN account_tax_repartition_line atrl ON
-            (tax2parent.tax_id = atrl.invoice_tax_id OR
-             tax2parent.tax_id = atrl.refund_tax_id)
-        ON CONFLICT DO NOTHING"""
+        SELECT MAX(depth) FROM tax2parent
+        """
     )
+    max_depth = env.cr.fetchone()[0]
+    if max_depth == 20:
+        raise Exception("account.tax recursion detected, max recursion depth of 20 exceeded")
     openupgrade.logged_query(
         env.cr, """
         INSERT INTO account_tax_repartition_financial_tags (
